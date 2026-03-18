@@ -46,12 +46,22 @@ jobs:
         run: |
           set +e  # Don't fail the step if notification fails
 
-          # 1. Extract issue identifier from branch name
+          # 1. Extract issue identifier — try branch name first, then PR title
           BRANCH="${{ github.head_ref || github.ref_name }}"
           ISSUE_ID=$(echo "$BRANCH" | grep -oE 'ASM-[0-9]+' | head -1)
 
+          # Fallback: check PR title for ASM-xxx (handles release PRs)
           if [ -z "$ISSUE_ID" ]; then
-            echo "::notice::No ASM issue ID in branch name '$BRANCH' — skipping notification"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            if [ -n "$PR_NUMBER" ]; then
+              PR_TITLE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json title --jq '.title' 2>/dev/null)
+              ISSUE_ID=$(echo "$PR_TITLE" | grep -oE 'ASM-[0-9]+' | head -1)
+              [ -n "$ISSUE_ID" ] && echo "Found issue in PR title: $ISSUE_ID"
+            fi
+          fi
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "::notice::No ASM issue ID in branch '$BRANCH' or PR title — skipping notification"
             exit 0
           fi
 
