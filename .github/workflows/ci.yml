@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [main, staging]
+
+env:
+  PAPERCLIP_HOST: ${{ secrets.PAPERCLIP_TAILSCALE_HOST }}
+  PAPERCLIP_COMPANY_ID: ${{ secrets.PAPERCLIP_COMPANY_ID }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: |
+          echo "Running tests..."
+          if [ -f FAIL_CI ]; then
+            echo "FAIL_CI marker found — failing intentionally"
+            exit 1
+          fi
+          echo "Tests passed"
+
+      # ============================================================
+      # PAPERCLIP INTEGRATION — Tailscale → Paperclip notification
+      # Notifies the assigned agent on CI failure or success.
+      # ============================================================
+
+      - name: Connect to Tailscale
+        if: always()
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Notify Paperclip on CI result
+        if: always()
+        run: |
+          set +e  # Don't fail the step if notification fails
+
+          # 1. Extract issue identifier from branch name
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          ISSUE_ID=$(echo "$BRANCH" | grep -oE 'ASM-[0-9]+' | head -1)
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "::notice::No ASM issue ID in branch name '$BRANCH' — skipping notification"
+            exit 0
+          fi
+
+          echo "Found issue: $ISSUE_ID"
+
+          # 2. Look up the issue to find the current assignee
+          ISSUE_JSON=$(curl -sf "http://$PAPERCLIP_HOST/api/issues/$ISSUE_ID" 2>/dev/null)
+          if [ $? -ne 0 ] || [ -z "$ISSUE_JSON" ]; then
+            echo "::warning::Could not reach Paperclip API or issue $ISSUE_ID not found"
+            exit 0
+          fi
+
+          ASSIGNEE_ID=$(echo "$ISSUE_JSON" | jq -r '.assigneeAgentId // empty')
+
+          # 3. Look up agent name for @mention
+          AGENT_MENTION=""
+          if [ -n "$ASSIGNEE_ID" ]; then
+            AGENT_NAME=$(curl -sf "http://$PAPERCLIP_HOST/api/agents/$ASSIGNEE_ID" 2>/dev/null | jq -r '.name // empty')
+            if [ -n "$AGENT_NAME" ]; then
+              AGENT_MENTION="@$AGENT_NAME"
+              echo "Will @mention: $AGENT_MENTION"
+            fi
+          fi
+
+          # 4. Determine CI result
+          CI_RESULT="${{ job.status }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$CI_RESULT" = "success" ]; then
+            BODY="## CI Passed
+
+          ${AGENT_MENTION} CI passed on \`${BRANCH}\`.
+
+          - **Repository**: ${{ github.repository }}
+          - **Run**: ${RUN_URL}
+          - **Trigger**: ${{ github.event_name }}"
+          else
+            BODY="## CI Failure
+
+          ${AGENT_MENTION} [RETRO] CI failed on \`${BRANCH}\`.
+
+          - **Repository**: ${{ github.repository }}
+          - **Job**: ${{ github.job }}
+          - **Trigger**: ${{ github.event_name }}
+          - **Run**: ${RUN_URL}
+
+          Please investigate and fix."
+          fi
+
+          # 5. Post comment on the Paperclip issue
+          RESPONSE=$(curl -sf -w "\n%{http_code}" -X POST \
+            "http://$PAPERCLIP_HOST/api/issues/$ISSUE_ID/comments" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')" 2>/dev/null)
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            echo "Posted $CI_RESULT notification to $ISSUE_ID (${AGENT_MENTION:-no assignee})"
+          else
+            echo "::warning::Paperclip API returned HTTP $HTTP_CODE: $RESPONSE_BODY"
+          fi
