@@ -41,22 +41,34 @@ jobs:
 
       - name: Notify Paperclip on CI result
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e  # Don't fail the step if notification fails
 
-          # 1. Extract issue identifier from branch name
+          # 1. Extract issue identifier — try branch name first, then PR title
           BRANCH="${{ github.head_ref || github.ref_name }}"
           ISSUE_ID=$(echo "$BRANCH" | grep -oE 'ASM-[0-9]+' | head -1)
 
+          # Fallback: check PR title for ASM-xxx (handles release PRs)
           if [ -z "$ISSUE_ID" ]; then
-            echo "::notice::No ASM issue ID in branch name '$BRANCH' — skipping notification"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            if [ -n "$PR_NUMBER" ]; then
+              PR_TITLE=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json title --jq '.title' 2>/dev/null)
+              ISSUE_ID=$(echo "$PR_TITLE" | grep -oE 'ASM-[0-9]+' | head -1)
+              [ -n "$ISSUE_ID" ] && echo "Found issue in PR title: $ISSUE_ID"
+            fi
+          fi
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "::notice::No ASM issue ID in branch '$BRANCH' or PR title — skipping notification"
             exit 0
           fi
 
           echo "Found issue: $ISSUE_ID"
 
           # 2. Look up the issue to find the current assignee
-          ISSUE_JSON=$(curl -sf "http://$PAPERCLIP_HOST/api/issues/$ISSUE_ID" 2>/dev/null)
+          ISSUE_JSON=$(curl -sf "https://$PAPERCLIP_HOST/api/issues/$ISSUE_ID" 2>/dev/null)
           if [ $? -ne 0 ] || [ -z "$ISSUE_JSON" ]; then
             echo "::warning::Could not reach Paperclip API or issue $ISSUE_ID not found"
             exit 0
@@ -67,41 +79,81 @@ jobs:
           # 3. Look up agent name for @mention
           AGENT_MENTION=""
           if [ -n "$ASSIGNEE_ID" ]; then
-            AGENT_NAME=$(curl -sf "http://$PAPERCLIP_HOST/api/agents/$ASSIGNEE_ID" 2>/dev/null | jq -r '.name // empty')
+            AGENT_NAME=$(curl -sf "https://$PAPERCLIP_HOST/api/agents/$ASSIGNEE_ID" 2>/dev/null | jq -r '.name // empty')
             if [ -n "$AGENT_NAME" ]; then
               AGENT_MENTION="@$AGENT_NAME"
-              echo "Will @mention: $AGENT_MENTION"
+              echo "Will @mention assignee: $AGENT_MENTION"
             fi
           fi
 
-          # 4. Determine CI result
+          # 4. Get unique commit authors from PR for @mentions
+          AUTHOR_MENTIONS=""
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -n "$PR_NUMBER" ]; then
+            COMMIT_AUTHORS=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json commits --jq '[.commits[].authors[].name | split(" ") | .[0]] | unique | .[]' 2>/dev/null)
+            if [ -n "$COMMIT_AUTHORS" ]; then
+              while IFS= read -r author; do
+                if [ -n "$author" ]; then
+                  AUTHOR_MENTIONS="${AUTHOR_MENTIONS} @${author}"
+                fi
+              done <<< "$COMMIT_AUTHORS"
+              AUTHOR_MENTIONS=$(echo "$AUTHOR_MENTIONS" | xargs)
+              echo "Commit author mentions: $AUTHOR_MENTIONS"
+            fi
+          fi
+
+          # 5. Build deduplicated mention list (assignee + commit authors)
+          ALL_MENTIONS=""
+          SEEN_NAMES=""
+          # Add assignee first
+          if [ -n "$AGENT_MENTION" ]; then
+            ALL_MENTIONS="$AGENT_MENTION"
+            SEEN_NAMES=$(echo "$AGENT_MENTION" | sed 's/@//')
+          fi
+          # Add commit authors (skip if already mentioned as assignee)
+          if [ -n "$AUTHOR_MENTIONS" ]; then
+            for mention in $AUTHOR_MENTIONS; do
+              name=$(echo "$mention" | sed 's/@//')
+              if ! echo "$SEEN_NAMES" | grep -qw "$name"; then
+                ALL_MENTIONS="${ALL_MENTIONS} ${mention}"
+                SEEN_NAMES="${SEEN_NAMES} ${name}"
+              fi
+            done
+          fi
+          ALL_MENTIONS=$(echo "$ALL_MENTIONS" | xargs)
+          echo "All mentions (deduplicated): $ALL_MENTIONS"
+
+          # 6. Determine CI result
           CI_RESULT="${{ job.status }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "$CI_RESULT" = "success" ]; then
             BODY="## CI Passed
 
-          ${AGENT_MENTION} CI passed on \`${BRANCH}\`.
+          ${ALL_MENTIONS} CI passed on \`${BRANCH}\`.
 
-          - **Repository**: ${{ github.repository }}
-          - **Run**: ${RUN_URL}
-          - **Trigger**: ${{ github.event_name }}"
+          - **Repository**: \`${{ github.event.repository.name }}\`
+          - **Branch**: \`${BRANCH}\`
+          - **Job**: \`${{ github.job }}\`
+          - **Run**: [View run](${RUN_URL})
+          - **Trigger**: \`${{ github.event_name }}\`"
           else
             BODY="## CI Failure
 
-          ${AGENT_MENTION} [RETRO] CI failed on \`${BRANCH}\`.
+          ${ALL_MENTIONS} CI failed on \`${BRANCH}\`.
 
-          - **Repository**: ${{ github.repository }}
-          - **Job**: ${{ github.job }}
-          - **Trigger**: ${{ github.event_name }}
-          - **Run**: ${RUN_URL}
+          - **Repository**: \`${{ github.event.repository.name }}\`
+          - **Branch**: \`${BRANCH}\`
+          - **Job**: \`${{ github.job }}\`
+          - **Run**: [View run](${RUN_URL})
+          - **Trigger**: \`${{ github.event_name }}\`
 
-          Please investigate and fix."
+          Please investigate the failure and push a fix. Click the run link above to see which step failed."
           fi
 
-          # 5. Post comment on the Paperclip issue
+          # 7. Post comment on the Paperclip issue
           RESPONSE=$(curl -sf -w "\n%{http_code}" -X POST \
-            "http://$PAPERCLIP_HOST/api/issues/$ISSUE_ID/comments" \
+            "https://$PAPERCLIP_HOST/api/issues/$ISSUE_ID/comments" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg body "$BODY" '{body: $body}')" 2>/dev/null)
 
@@ -109,7 +161,7 @@ jobs:
           RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
 
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-            echo "Posted $CI_RESULT notification to $ISSUE_ID (${AGENT_MENTION:-no assignee})"
+            echo "Posted $CI_RESULT notification to $ISSUE_ID (mentions: ${ALL_MENTIONS:-none})"
           else
             echo "::warning::Paperclip API returned HTTP $HTTP_CODE: $RESPONSE_BODY"
           fi
